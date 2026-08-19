@@ -1,583 +1,192 @@
 import os
-import io
-import sys
-import traceback
-
-from typing import TypedDict, List, Optional
-
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
-
-from langchain_core.messages import BaseMessage, HumanMessage
+import uvicorn
+from fastapi import FastAPI
+from langserve import add_routes
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
-
-from langgraph.graph import StateGraph, START, END
-
-
-# ============================================================
-# GEMINI API KEY
-# ============================================================
-
-API_KEY = os.environ.get("GEMINI_API_KEY")
-
-if not API_KEY:
-    raise RuntimeError("GEMINI_API_KEY environment variable is not configured.")
+from langchain.agents import create_agent
+from pydantic import BaseModel, Field
+from langchain_core.runnables import RunnableLambda
 
 
-# ============================================================
-# GEMINI MODEL
-# ============================================================
+# --- 1. Define Tool ---
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-3.1-flash-lite-preview",
-    google_api_key=API_KEY,
+@tool
+def get_state_capital(state: str) -> str:
+    """Get the capital city of an Indian state."""
+
+    state_capitals = {
+        "andhra pradesh": "Amaravati",
+        "arunachal pradesh": "Itanagar",
+        "assam": "Dispur",
+        "bihar": "Patna",
+        "chhattisgarh": "Raipur",
+        "goa": "Panaji",
+        "gujarat": "Gandhinagar",
+        "haryana": "Chandigarh",
+        "himachal pradesh": "Shimla",
+        "jharkhand": "Ranchi",
+        "karnataka": "Bengaluru",
+        "kerala": "Thiruvananthapuram",
+        "madhya pradesh": "Bhopal",
+        "maharashtra": "Mumbai",
+        "manipur": "Imphal",
+        "meghalaya": "Shillong",
+        "mizoram": "Aizawl",
+        "nagaland": "Kohima",
+        "odisha": "Bhubaneswar",
+        "punjab": "Chandigarh",
+        "rajasthan": "Jaipur",
+        "sikkim": "Gangtok",
+        "tamil nadu": "Chennai",
+        "telangana": "Hyderabad",
+        "tripura": "Agartala",
+        "uttar pradesh": "Lucknow",
+        "uttarakhand": "Dehradun",
+        "west bengal": "Kolkata"
+    }
+
+    state_key = state.strip().lower()
+
+    result = state_capitals.get(state_key)
+
+    if result:
+        return f"The capital of {state.title()} is {result}."
+
+    return (
+        f"Capital information not found for {state.title()}. "
+        "Please provide a valid Indian state."
+    )
+
+
+tools = [
+    get_state_capital
+]
+
+
+# --- 2. Initialize Model & Agent ---
+
+GOOGLE_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+llm_flash = ChatGoogleGenerativeAI(
+    model="gemma-4-31b-it",
+    api_key=GOOGLE_API_KEY,
     temperature=0
 )
 
 
-# ============================================================
-# LANGGRAPH STATE
-# ============================================================
-
-class CrewState(TypedDict, total=False):
-    messages: List[BaseMessage]
-    code: Optional[str]
-    report: Optional[str]
-
-
-# ============================================================
-# TOOL: RUN PYTHON CODE
-# ============================================================
-
-@tool
-def run_python_code(code: str) -> str:
-    """Execute Python code and return output or error."""
-
-    clean_code = (
-        str(code)
-        .replace("```python", "")
-        .replace("```", "")
-        .strip()
+agent = create_agent(
+    model=llm_flash,
+    tools=tools,
+    system_prompt=(
+        "You are a specialized agent restricted ONLY to Indian states "
+        "and their state capitals. "
+        "You can answer questions about the capital of an Indian state. "
+        "For any other topics, questions, countries, currencies, "
+        "or general knowledge outside of Indian states and their capitals, "
+        "you must say exactly: "
+        "'I am not authorized to answer questions outside of Indian states and their capitals.'"
     )
-
-    old_stdout = sys.stdout
-    new_stdout = io.StringIO()
-
-    sys.stdout = new_stdout
-
-    try:
-        exec(clean_code, {}, {})
-        result = new_stdout.getvalue()
-
-    except Exception:
-        result = traceback.format_exc()
-
-    finally:
-        sys.stdout = old_stdout
-
-    return result.strip() or "Success (no terminal output)"
+)
 
 
-# ============================================================
-# TOOL: GENERATE TEST CASES
-# ============================================================
+# --- 3. Input Model ---
 
-@tool
-def generate_test_cases(task_description: str) -> str:
-    """Generate test cases for a coding task."""
-
-    prompt = f"""
-You are a senior QA engineer.
-
-Generate 3 to 5 specific test cases for this Python programming task:
-
-{task_description}
-
-Include:
-1. Normal cases
-2. Edge cases
-3. Invalid cases
-
-Return only a numbered list.
-"""
-
-    response = llm.invoke(prompt)
-
-    return str(response.content)
+class AgentInput(BaseModel):
+    input: str = Field(description="Your message to the agent")
 
 
-# ============================================================
-# DEVELOPER NODE
-# ============================================================
+def format_for_agent(x) -> dict:
 
-def developer_node(state: CrewState):
-
-    task = state["messages"][-1].content
-
-    prompt = f"""
-You are a senior Python developer.
-
-Write a clean Python program to solve this task:
-
-{task}
-
-Rules:
-- Return ONLY Python code.
-- Do not use Markdown.
-- Do not include ```python.
-- Do not explain the code.
-- The program must be executable.
-- Use standard Python libraries whenever possible.
-"""
-
-    response = llm.invoke(prompt)
-
-    code = str(response.content)
-
-    code = (
-        code
-        .replace("```python", "")
-        .replace("```", "")
-        .strip()
+    user_input = (
+        x["input"]
+        if isinstance(x, dict)
+        else x.input
     )
 
     return {
-        "code": code
-    }
-
-
-# ============================================================
-# TESTER NODE
-# ============================================================
-
-def tester_node(state: CrewState):
-
-    task = state["messages"][-1].content
-
-    tests = generate_test_cases.invoke({
-        "task_description": task
-    })
-
-    execution = run_python_code.invoke({
-        "code": state["code"]
-    })
-
-    report = f"""
-GENERATED CODE
-
-{state["code"]}
-
-
-EXECUTION OUTPUT
-
-{execution}
-
-
-TEST CASES
-
-{tests}
-"""
-
-    return {
-        "report": report
-    }
-
-
-# ============================================================
-# LANGGRAPH WORKFLOW
-# ============================================================
-
-workflow = StateGraph(CrewState)
-
-workflow.add_node(
-    "developer",
-    developer_node
-)
-
-workflow.add_node(
-    "tester",
-    tester_node
-)
-
-workflow.add_edge(
-    START,
-    "developer"
-)
-
-workflow.add_edge(
-    "developer",
-    "tester"
-)
-
-workflow.add_edge(
-    "tester",
-    END
-)
-
-graph = workflow.compile()
-
-
-# ============================================================
-# RUN LANGGRAPH
-# ============================================================
-
-def run_langgraph(task: str):
-
-    result = graph.invoke({
         "messages": [
-            HumanMessage(content=task)
-        ],
-        "code": None,
-        "report": None
-    })
-
-    return result["report"]
+            ("user", user_input)
+        ]
+    }
 
 
-# ============================================================
-# FASTAPI
-# ============================================================
+def extract_text_response(agent_output: dict) -> str:
+
+    if not isinstance(agent_output, dict):
+        return str(agent_output)
+
+    # Case 1: top-level messages
+    messages = agent_output.get("messages")
+
+    # Case 2: nested under a node name
+    if messages is None:
+
+        for value in agent_output.values():
+
+            if isinstance(value, dict) and "messages" in value:
+                messages = value["messages"]
+                break
+
+    if messages:
+
+        last = messages[-1]
+
+        return getattr(
+            last,
+            "content",
+            str(last)
+        )
+
+    return str(agent_output)
+
+
+formatted_agent_chain = (
+    RunnableLambda(format_for_agent)
+    | agent
+    | RunnableLambda(extract_text_response)
+).with_types(
+    input_type=AgentInput,
+    output_type=str
+)
+
+
+# --- 4. FastAPI App ---
 
 app = FastAPI(
-    title="LangGraph Coding Agent",
-    version="1.0.0",
-
-    # Disable Swagger
-    docs_url=None,
-
-    # Disable ReDoc
-    redoc_url=None,
-
-    # Disable OpenAPI
-    openapi_url=None
+    title="Indian State Capital Agent",
+    version="1.0",
+    description=(
+        "A LangChain agent using Gemini with a tool "
+        "for finding the capitals of Indian states."
+    )
 )
 
-
-# ============================================================
-# LANGGRAPH WEB PAGE
-# ============================================================
-
-HTML_PAGE = """
-<!DOCTYPE html>
-
-<html>
-
-<head>
-
-<title>LangGraph Coding Agent</title>
-
-<meta name="viewport"
-      content="width=device-width, initial-scale=1">
-
-<style>
-
-* {
-    box-sizing: border-box;
-}
-
-body {
-    margin: 0;
-    font-family: Arial, sans-serif;
-    background: #f3f4f6;
-}
-
-.container {
-    max-width: 900px;
-    margin: 50px auto;
-    padding: 20px;
-}
-
-.card {
-    background: white;
-    padding: 30px;
-    border-radius: 16px;
-    box-shadow: 0 5px 25px rgba(0,0,0,0.08);
-}
-
-h1 {
-    text-align: center;
-    margin-top: 0;
-}
-
-.subtitle {
-    text-align: center;
-    color: #666;
-    margin-bottom: 25px;
-}
-
-textarea {
-    width: 100%;
-    min-height: 180px;
-    padding: 15px;
-    font-size: 16px;
-    border: 1px solid #ccc;
-    border-radius: 10px;
-    resize: vertical;
-}
-
-button {
-    width: 100%;
-    margin-top: 15px;
-    padding: 14px;
-    border: none;
-    border-radius: 10px;
-    background: #111827;
-    color: white;
-    font-size: 16px;
-    cursor: pointer;
-}
-
-button:hover {
-    background: #000;
-}
-
-button:disabled {
-    background: #888;
-    cursor: not-allowed;
-}
-
-#loading {
-    display: none;
-    text-align: center;
-    margin-top: 15px;
-    color: #555;
-}
-
-#result {
-    margin-top: 25px;
-    padding: 20px;
-    background: #f8fafc;
-    border: 1px solid #ddd;
-    border-radius: 10px;
-    white-space: pre-wrap;
-    overflow-x: auto;
-    font-family: Consolas, monospace;
-}
-
-</style>
-
-</head>
-
-
-<body>
-
-<div class="container">
-
-<div class="card">
-
-<h1>LangGraph Coding Agent</h1>
-
-<div class="subtitle">
-Enter a Python programming task
-</div>
-
-<textarea
-    id="task"
-    placeholder="Example: Write a Python program to calculate factorial">
-</textarea>
-
-<button
-    id="runButton"
-    onclick="runLangGraph()">
-
-    Run LangGraph
-
-</button>
-
-<div id="loading">
-    Running LangGraph...
-</div>
-
-<div id="result">
-    Result will appear here.
-</div>
-
-</div>
-
-</div>
-
-
-<script>
-
-async function runLangGraph() {
-
-    const task =
-        document.getElementById("task").value.trim();
-
-    const result =
-        document.getElementById("result");
-
-    const button =
-        document.getElementById("runButton");
-
-    const loading =
-        document.getElementById("loading");
-
-
-    if (!task) {
-
-        result.textContent =
-            "Please enter a coding task.";
-
-        return;
-    }
-
-
-    button.disabled = true;
-
-    loading.style.display = "block";
-
-    result.textContent = "Processing...";
-
-
-    try {
-
-        const response = await fetch(
-            "/langgraph",
-            {
-                method: "POST",
-
-                headers: {
-                    "Content-Type":
-                        "application/json"
-                },
-
-                body: JSON.stringify({
-                    task: task
-                })
-            }
-        );
-
-
-        const data =
-            await response.json();
-
-
-        if (!response.ok) {
-
-            throw new Error(
-                data.detail ||
-                "Something went wrong."
-            );
-        }
-
-
-        result.textContent =
-            data.result;
-
-
-    } catch (error) {
-
-        result.textContent =
-            "Error: " + error.message;
-
-    }
-
-
-    button.disabled = false;
-
-    loading.style.display = "none";
-}
-
-</script>
-
-</body>
-
-</html>
-"""
-
-
-# ============================================================
-# GET /langgraph
-# ============================================================
-
-@app.get(
-    "/langgraph",
-    response_class=HTMLResponse
-)
-def langgraph_page():
-
-    return HTML_PAGE
-
-
-# ============================================================
-# POST /langgraph
-# ============================================================
-
-@app.post("/langgraph")
-async def langgraph_endpoint(request: dict):
-
-    task = request.get("task")
-
-    if not task:
-        raise HTTPException(
-            status_code=400,
-            detail="Task is required."
-        )
-
-    try:
-
-        print(
-            f"[LangGraph] Received task: {task}"
-        )
-
-        result = run_langgraph(task)
-
-        print(
-            "[LangGraph] Execution completed."
-        )
-
-        return {
-            "success": True,
-            "result": result
-        }
-
-    except Exception as e:
-
-        print(
-            f"[LangGraph] ERROR: {str(e)}"
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-
-# ============================================================
-# HEALTH CHECK
-# ============================================================
-
-@app.get("/health")
-def health():
-
-    return {
-        "status": "healthy",
-        "service": "LangGraph Coding Agent"
-    }
-
-
-# ============================================================
-# ROOT
-# ============================================================
 
 @app.get("/")
 def root():
 
     return {
-        "application": "LangGraph Coding Agent",
-        "open": "/langgraph"
+        "message": (
+            "Server is running. "
+            "Visit /agent/playground/ to chat, "
+            "or /docs for the API."
+        )
     }
 
 
-# ============================================================
-# START SERVER
-# ============================================================
+# --- 5. Add LangServe Route ---
+
+add_routes(
+    app,
+    formatted_agent_chain,
+    path="/agent"
+)
+
+
+# --- 6. Run Server ---
 
 if __name__ == "__main__":
-
-    import uvicorn
 
     port = int(
         os.environ.get("PORT", 8000)
